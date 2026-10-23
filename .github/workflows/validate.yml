@@ -12,3 +12,5 @@ jobs:
           node-version: '24'
       - run: node --check scripts/verify-mac.mjs
       - run: node --test scripts/prepare.test.mjs
+      - run: node --check scripts/promote-free.mjs
+      - run: node --test scripts/free-feed.test.mjs

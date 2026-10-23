@@ -15,3 +15,7 @@
 工作流拒绝预发布版本、版本倒退及未知发布者。重试可在 Actions 手动运行并填写版本标签。更新检查失败不会影响已有应用使用。
 
 更新入口：`https://raw.githubusercontent.com/Fun336/suishouwen-releases/main/`
+
+## 免费 Mac 通道
+
+现已配置独立的 [mac-free 通道](mac-free/README.md)，使用固定公钥验证 Sparkle 更新清单与安装包。初始清单为空且已签名，暂无实际可安装更新。免费通道不需要 Apple 会员，但不提供 Apple 公证或免提示首次安装。
