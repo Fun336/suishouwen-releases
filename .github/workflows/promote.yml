@@ -1,0 +1,100 @@
+name: Promote verified release
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published stable release tag (vX.Y.Z)
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: promote-release
+  cancel-in-progress: false
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: mac-arm64
+            os: macos-15
+          - target: mac-x64
+            os: macos-15
+          - target: windows-x64
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - id: prepare
+        run: node scripts/prepare.mjs
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          TARGET: ${{ matrix.target }}
+          GITHUB_TOKEN: ${{ github.token }}
+      - if: steps.prepare.outputs.found == 'true' && runner.os == 'macOS'
+        run: node scripts/verify-mac.mjs
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          TARGET: ${{ matrix.target }}
+      - if: steps.prepare.outputs.found == 'true' && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          EXPECTED_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER_SUBJECT }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:EXPECTED_PUBLISHER)) { throw 'Set WINDOWS_PUBLISHER_SUBJECT repository variable' }
+          $signature = Get-AuthenticodeSignature -LiteralPath 'payload/update.exe'
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -cne $env:EXPECTED_PUBLISHER) { throw 'Invalid installer signature or unexpected publisher' }
+      - if: steps.prepare.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: feed-${{ matrix.target }}
+          path: feeds/
+          retention-days: 7
+  promote:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: feed-*
+          path: feeds
+          merge-multiple: true
+      - uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        with:
+          script: |
+            const fs = require('node:fs/promises');
+            const version = process.env.RELEASE_TAG.slice(1);
+            const paths = ['mac/arm64.json','mac/x64.json','windows/x64.json'];
+            const changes = [];
+            const ref = await github.rest.git.getRef({...context.repo,ref:'heads/main'});
+            for (const path of paths) {
+              let content; try { content = await fs.readFile('feeds/'+path, 'utf8'); } catch (e) { if(e.code === 'ENOENT') continue; throw e; }
+              const next = JSON.parse(content);
+              if ((next.currentRelease || next.version) !== version) throw Error('Version mismatch');
+              const old = await github.rest.repos.getContent({...context.repo,path,ref:ref.data.object.sha});
+              const previous = JSON.parse(Buffer.from(old.data.content,'base64').toString());
+              const cmp = (a,b) => { const x=a.split('.').map(Number), y=b.split('.').map(Number); for(let i=0;i<3;i++) if(x[i]!==y[i]) return x[i]-y[i]; return 0; };
+              if(cmp(version, previous.currentRelease || previous.version)<0) throw Error('Refusing version downgrade');
+              if(cmp(version, previous.currentRelease || previous.version)===0) {
+                if(JSON.stringify(next)!==JSON.stringify(previous)) throw Error('Refusing replacement of an existing version');
+                continue;
+              }
+              changes.push({path,mode:'100644',type:'blob',content});
+            }
+            if(!changes.length) { core.info('No new platform feeds to promote'); return; }
+            const commit = await github.rest.git.getCommit({...context.repo,commit_sha:ref.data.object.sha});
+            const tree = await github.rest.git.createTree({...context.repo,base_tree:commit.data.tree.sha,tree:changes});
+            const created = await github.rest.git.createCommit({...context.repo,message:`Publish verified updates ${version}`,tree:tree.data.sha,parents:[ref.data.object.sha]});
+            await github.rest.git.updateRef({...context.repo,ref:'heads/main',sha:created.data.sha,force:false});

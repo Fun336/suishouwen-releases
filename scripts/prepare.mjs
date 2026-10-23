@@ -1,0 +1,26 @@
+import {mkdir,writeFile,appendFile} from 'node:fs/promises';
+import {createWriteStream} from 'node:fs';
+import {Readable,Transform} from 'node:stream';
+import {pipeline} from 'node:stream/promises';
+import {createHash} from 'node:crypto';
+const {RELEASE_TAG:tag,TARGET:target,GITHUB_TOKEN:token,GITHUB_OUTPUT:output}=process.env;
+if(!/^v\d+\.\d+\.\d+$/.test(tag||''))throw Error('Stable vX.Y.Z tag required');
+if(!['mac-arm64','mac-x64','windows-x64'].includes(target))throw Error('Invalid target');
+const version=tag.slice(1),repo='Fun336/suishouwen-releases';
+const response=await fetch(`https://api.github.com/repos/${repo}/releases/tags/${tag}`,{headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json'}});
+if(!response.ok)throw Error(`Release lookup failed ${response.status}`);
+const release=await response.json();if(release.draft||release.prerelease)throw Error('Only published stable releases may be promoted');
+const mac=target.startsWith('mac-'),arch=mac?target.slice(4):'x64';
+const name=mac?`Suishouwen-${version}-mac-${arch}.zip`:`Suishouwen-${version}-Setup.exe`;
+const asset=release.assets.find(a=>a.name===name);
+if(!asset){await appendFile(output,'found=false\n');process.exit(0);}
+if(asset.size<=0||asset.size>2*1024**3)throw Error('Invalid asset size');
+await mkdir('payload',{recursive:true});await mkdir('feeds/'+(mac?'mac':'windows'),{recursive:true});
+const r=await fetch(asset.browser_download_url);if(!r.ok)throw Error('Download failed');
+const file=mac?'payload/update.zip':'payload/update.exe';
+let size=0;const hash=createHash('sha256');
+await pipeline(Readable.fromWeb(r.body),new Transform({transform(chunk,encoding,callback){size+=chunk.length;if(size>asset.size)return callback(Error('Download exceeds expected size'));hash.update(chunk);callback(null,chunk);}}),createWriteStream(file,{flags:'wx'}));
+if(size!==asset.size)throw Error('Size mismatch');
+const entry={version,url:asset.browser_download_url,sha256:hash.digest('hex'),size};
+await writeFile(`feeds/${mac?'mac':'windows'}/${arch}.json`,JSON.stringify(mac?{currentRelease:version,releases:[{version,updateTo:entry}]}:entry,null,2)+'\n');
+await appendFile(output,'found=true\n');
